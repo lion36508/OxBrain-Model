@@ -1,4 +1,4 @@
-# OxBrain Ultra-Power V3 Architecture (Pure Vectorized Add/Sub + Top-K MoE)
+# OxBrain Ultra-Power V3.1 Architecture (Shape-Safe Pure Add/Sub + Sparse MoE)
 import os
 import sys
 import gc
@@ -26,11 +26,6 @@ def quantize_2bit(w):
     return (sign * mag).astype(np.float32), float(scale)
 
 def add_sub_gemm(x, qw):
-    """
-    SIMD-friendly Vectorized Add/Sub Execution:
-    w in {-1.0, -0.5, 0.5, 1.0}
-    Multiplication replace hokar addition aur bit-shift mein chalti hai.
-    """
     half_x = x * 0.5
     p1 = (qw == 1.0).astype(np.float32)
     m1 = (qw == -1.0).astype(np.float32)
@@ -61,12 +56,10 @@ class UltraLinear2Bit:
         d_out_flat = d_out.reshape(-1, d_out.shape[-1])
         x_flat = self.x.reshape(-1, self.x.shape[-1])
 
-        # Straight-Through Estimator Backprop
         grad_w = np.matmul(d_out_flat.T, x_flat)
         grad_b = np.sum(d_out_flat, axis=0)
         grad_x = np.matmul(d_out_flat, self.qw) * self.scale
 
-        # AdamW Update
         self.mw = 0.9 * self.mw + 0.1 * grad_w
         self.vw = 0.999 * self.vw + 0.001 * (grad_w ** 2)
         m_hat = self.mw / 0.1
@@ -106,12 +99,10 @@ class FastMoELayer:
 
     def forward(self, x):
         self.x = x
-        b, l, d = x.shape
         router_logits = self.gate.forward(x)
         exp_logits = np.exp(router_logits - np.max(router_logits, axis=-1, keepdims=True))
-        self.gate_probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+        self.gate_probs = exp_logits / (np.sum(exp_logits, axis=-1, keepdims=True) + 1e-8)
 
-        # Top-K Expert Selection
         self.top_idx = np.argsort(self.gate_probs, axis=-1)[:, :, -self.top_k:]
         self.out = np.zeros_like(x)
         self.expert_acts = {}
@@ -159,7 +150,6 @@ class OxBrainUltra:
         b, l = ids.shape
         self.h = self.token_emb[ids] + self.pos_emb[:l]
 
-        # Multi-Head Attention
         h_norm1 = self.norm1.forward(self.h)
         qkv = self.qkv.forward(h_norm1).reshape(b, l, 3, HEADS, HEAD_DIM)
         q = qkv[:, :, 0].transpose(0, 2, 1, 3)
@@ -174,11 +164,9 @@ class OxBrainUltra:
         attended = np.matmul(self.attn, self.v).transpose(0, 2, 1, 3).reshape(b, l, D_MODEL)
         self.h = self.h + self.attn_proj.forward(attended)
 
-        # Sparse MoE Block
         h_norm2 = self.norm2.forward(self.h)
         self.h = self.h + self.moe.forward(h_norm2)
 
-        # Output Head
         return self.head.forward(self.norm_final.forward(self.h))
 
     def backward(self, d_logits, lr):
@@ -209,18 +197,22 @@ def train(steps):
 
     model = OxBrainUltra(len(vocab))
 
-    # Resume Weights Checkpoint
+    # शेप-सुरक्षित वेट्स लोडिंग (Shape-Safe Checkpoint Loader)
     if os.path.exists(WEIGHTS_FILE):
         try:
             saved = np.load(WEIGHTS_FILE)
-            model.token_emb = saved["token_emb"]
-            model.qkv.w = saved["qkv_w"]
-            model.qkv.b = saved["qkv_b"]
-            model.head.w = saved["head_w"]
-            model.head.b = saved["head_b"]
-            print("[Engine V3] Resumed previous training weights.")
-        except Exception:
-            pass
+            # अगर डाइमेंशन मैच करे तभी लोड करो, नहीं तो फ्रेश इनिशियलाइज करो
+            if saved["token_emb"].shape == model.token_emb.shape:
+                model.token_emb = saved["token_emb"]
+                model.qkv.w = saved["qkv_w"]
+                model.qkv.b = saved["qkv_b"]
+                model.head.w = saved["head_w"]
+                model.head.b = saved["head_b"]
+                print("[Engine V3.1] Compatible checkpoint matched and resumed.")
+            else:
+                print(f"[Engine V3.1] Checkpoint dimension mismatch ({saved['token_emb'].shape} vs {model.token_emb.shape}). Upgrading to D_MODEL={D_MODEL} clean state.")
+        except Exception as e:
+            print("[Engine V3.1] Initializing pristine parameter weights.")
 
     print(f"Architecture : 2-Bit Top-2 Sparse MoE ({D_MODEL} dim, {NUM_EXPERTS} experts)")
     print(f"Vocab / Tokens: {len(vocab)} vocab | {len(ids)} tokens")
@@ -242,7 +234,6 @@ def train(steps):
         correct = probs[np.arange(BATCH)[:, None], np.arange(CONTEXT), y_ids]
         loss = -np.mean(np.log(correct + 1e-10))
 
-        # Backward Pass
         d_logits = probs.copy()
         d_logits[np.arange(BATCH)[:, None], np.arange(CONTEXT), y_ids] -= 1.0
         d_logits /= (BATCH * CONTEXT)
@@ -260,7 +251,7 @@ def train(steps):
         head_b=model.head.b
     )
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"vocab": vocab, "steps": steps, "engine": "OxBrain-Ultra-V3"}, f)
+        json.dump({"vocab": vocab, "steps": steps, "d_model": D_MODEL, "engine": "OxBrain-Ultra-V3.1"}, f)
     print("Checkpoint successfully compiled and saved.")
 
 if __name__ == "__main__":
